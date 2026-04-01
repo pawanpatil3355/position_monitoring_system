@@ -7,6 +7,8 @@ const app = express();
 
 const allowedOrigins = [
   'http://localhost:5173',
+  'https://position-monitoring-system.vercel.app',
+  'https://position-monitoring-system-q07nbah3x.vercel.app',
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 

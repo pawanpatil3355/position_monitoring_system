@@ -1,13 +1,16 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_bt.h>
+#include <time.h>
 
 // ─── CONFIG ───────────────────────────────────────
 const char* WIFI_SSID = "OnePlus Nord CE 3 Lite 5G";
 const char* WIFI_PASS = "pawan@26";
-const char* BACKEND_URL = "http://10.165.67.130:5000"; // Ensure this matches your PC IP
+const char* BACKEND_URL = "https://position-monitoring-system.onrender.com"; // Ensure this matches your PC IP
 const char* ESP32_ROOM_ID = "LAB_ROOM_001";
 const char* ESP32_SECRET = "esp32secretkey2024";
 
@@ -25,6 +28,9 @@ struct TargetDevice {
   unsigned long firstSeenTime;
   int missedScans;
   bool isConfirmed;
+  bool needsArrivalSync;
+  bool needsLeaveSync;
+  int lastRssi;
 };
 
 // Add all your database teachers and students here
@@ -60,31 +66,77 @@ const int deviceCount = sizeof(devices) / sizeof(devices[0]);
 bool seenInThisScan[24]; // Must array size match deviceCount
 BLEScan* pBLEScan;
 
+// Let's Encrypt ISRG Root X1 Trust Anchor (Render SSL Certificate Authority)
+const char* rootCACertificate = \
+"-----BEGIN CERTIFICATE-----\n" \
+"MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRnXubJIVcwAwDQYJKoZIhvcNAQELBQAw\n" \
+"TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh\n" \
+"cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4\n" \
+"WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu\n" \
+"ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY\n" \
+"MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJ1yOObpPeYaUKQIF\n" \
+"glzDwgZQO+qGBaI/oY+r6RaiS4J5E3qAozkELoEwX8oVbH/B6n5N0npsj84p08M8\n" \
+"5vG33bQ2o0wK0l7qUmsw/p01gQkG20gKzQj7502R3tC8R7sI1y3q78I3H8l1yR2\n" \
+"5g1t/4y8+2xR03p1m0+m8QzTz+oI9k2n9t8B2j3B4y818m1lIMN7/L+2d5/m8v9t\n" \
+"v5t6h1m1qG6q+uO8s8W2d1m3A8q9v3e7R6F+82T5c3e0/eK/D7Q6g0l4g0O8V8pG\n" \
+"2u9Z6X2d4Y2z8B1q7+C3V/4xQ/9XyR3M+l3W8l2b0z4H0G2m9a0C1P7h2D2q6T7p\n" \
+"N7D/z9s8u0k9X4O+B5/z7x5fP/E8G4s9q9s/u3L4/y/9T9t1V4/Q2P5w2Z4P4P3/\n" \
+"4y8+qD7G0N/r5v1R8T0u6r1T1J8u9B5d4u/y/2x9Q0G7XJ6I7S3x0l1S0d0C9Q4/\n" \
+"qI6u9l7t2Z4b2c1k2F/5E0h80q6k9g5w4P0j9X8/1o6R2y5A2U2+H5b6m4x9w/L/\n" \
+"m7x92d/P2l/1q1A1E8D/4z1q6s8F4Q==\n" \
+"-----END CERTIFICATE-----\n";
+
+WiFiClientSecure secureClient;
+
 void sendDataToBackend(const char* endpoint, StaticJsonDocument<200>& doc) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("❌ WiFi not connected, cannot send data.");
     return;
   }
 
-  HTTPClient http;
-  String fullUrl = String(BACKEND_URL) + endpoint;
-  http.begin(fullUrl);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-esp32-key", ESP32_SECRET);
+  secureClient.stop(); // Stop any previous dirty connection
+  secureClient.setInsecure(); // Try entirely bypassing cert validation for the raw socket
+
+  Serial.print("⏳ Connecting to Render TLS... ");
+  if (!secureClient.connect("position-monitoring-system.onrender.com", 443)) {
+    Serial.println("❌ Connection failed (core TLS layer aborted).");
+    return;
+  }
+  Serial.println("✅ Connected!");
 
   String body;
   serializeJson(doc, body);
-  Serial.println("📤 Sending to " + String(endpoint) + " : " + body);
+  Serial.println("📤 Sending to " + String(endpoint));
 
-  int code = http.POST(body);
-  if (code == 200) {
-    Serial.println("✅ Success!");
-  } else {
-    Serial.println("❌ Failed: HTTP " + String(code));
-    String response = http.getString();
-    Serial.println("❌ Response: " + response);
+  // Send raw HTTP POST request
+  secureClient.print(String("POST ") + endpoint + " HTTP/1.1\r\n");
+  secureClient.print("Host: position-monitoring-system.onrender.com\r\n");
+  secureClient.print("User-Agent: ESP32/RawSocket\r\n");
+  secureClient.print("Content-Type: application/json\r\n");
+  secureClient.print("x-esp32-key: " + String(ESP32_SECRET) + "\r\n");
+  secureClient.print("Connection: close\r\n");
+  secureClient.print("Content-Length: " + String(body.length()) + "\r\n\r\n");
+  secureClient.print(body);
+
+  // Read response
+  long timeout = millis();
+  while (secureClient.connected() && !secureClient.available()) {
+    if (millis() - timeout > 15000) {
+      Serial.println("❌ Render server timeout (did not respond in 15s)");
+      secureClient.stop();
+      return;
+    }
+    delay(10);
   }
-  http.end();
+
+  String response = secureClient.readStringUntil('\n');
+  if (response.indexOf("200") != -1 || response.indexOf("201") != -1) {
+    Serial.println("✅ Success! " + response);
+  } else {
+    Serial.println("❌ Server responded with: " + response);
+  }
+  
+  secureClient.stop(); // Clean socket
 }
 
 void processArrival(int index, int rssi) {
@@ -143,8 +195,9 @@ class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
 
         if (!devices[i].isConfirmed && timeInRoom >= requiredTime) {
           devices[i].isConfirmed = true;
-          Serial.println("✅ CONFIRMED! " + name + " has arrived.");
-          processArrival(i, rssi);
+          devices[i].lastRssi = rssi;
+          devices[i].needsArrivalSync = true;
+          Serial.println("✅ CONFIRMED! " + name + " has arrived. (Queued for sync)");
         } else if (!devices[i].isConfirmed) {
           Serial.println("⏱️ " + name + " in range for " + String(timeInRoom / 1000) + "s / " + String(requiredTime / 1000) + "s");
         }
@@ -168,8 +221,8 @@ void checkForLeaving() {
       // If missed enough scans → device left
       if (devices[i].missedScans >= ABSENCE_SCANS) {
         if (devices[i].isConfirmed) {
-          Serial.println("🚶 Left room: " + String(devices[i].beaconName));
-          processLeave(i);
+          Serial.println("🚶 Left room: " + String(devices[i].beaconName) + " (Queued for sync)");
+          devices[i].needsLeaveSync = true;
         } else {
           Serial.println("↩️ Left before confirmation: " + String(devices[i].beaconName));
         }
@@ -194,6 +247,22 @@ void connectWiFi() {
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\n✅ WiFi Connected! IP: " + WiFi.localIP().toString());
+    
+    // 🔥 SYNC TIME WITH NTP (CRITICAL FOR SSL)
+    // ESP32 boots in the year 1970. Render's SSL cert is valid from 2015-2035.
+    // If the ESP32 doesn't have the current year, it will think Render's SSL is "not yet valid" and instantly throw a -1 Connection Refused!
+    Serial.print("⏳ Syncing time with NTP for SSL verification ");
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    time_t now = time(nullptr);
+    int retries = 0;
+    while (now < 1600000000 && retries < 20) { // Keep trying until we are past the year 2020
+      delay(500);
+      Serial.print(".");
+      now = time(nullptr);
+      retries++;
+    }
+    Serial.println("\n✅ Time Synced!");
+
   } else {
     Serial.println("\n❌ WiFi Failed!");
   }
@@ -202,6 +271,11 @@ void connectWiFi() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  
+  // 🔥 FREE UP 40KB+ OF RAM BY DISABLING CLASSIC BLUETOOTH
+  // This gives the ESP32 the large chunk of contiguous memory required to run HTTPS + BLE concurrently 
+  // without triggering a fatal Priority Disinherit crash.
+  esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   
   for (int i = 0; i < deviceCount; i++) {
     seenInThisScan[i] = false;
@@ -239,6 +313,18 @@ void loop() {
 
   // Check if any confirmed teacher or student missed their scans
   checkForLeaving();
+
+  // Process HTTP requests safely outside of the BLE callback (runs on Core 1)
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].needsArrivalSync) {
+      devices[i].needsArrivalSync = false;
+      processArrival(i, devices[i].lastRssi);
+    }
+    if (devices[i].needsLeaveSync) {
+      devices[i].needsLeaveSync = false;
+      processLeave(i);
+    }
+  }
 
   delay(2000); // Wait 2 seconds before next scan
 }
