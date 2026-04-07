@@ -55,7 +55,7 @@ body {
   flex-direction: column;
   position: fixed;
   top: 64px; left: 0; bottom: 0;
-  z-index: 100;
+  z-index: 200;
   transition: transform 0.3s, width 0.3s;
   overflow-y: auto;
 }
