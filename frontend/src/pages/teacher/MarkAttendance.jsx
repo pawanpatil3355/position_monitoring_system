@@ -66,22 +66,23 @@ export default function MarkAttendance() {
       // 1. Fetch Students
       const stRes = await api.get('/students');
       
-      const initialSt = stRes.data.map(s => ({
-        student_id: s.student_id,
-        name: s.name,
-        roll_number: s.roll_number,
-        status: 'present'
-      }));
-
-      // 2. Fetch existing history for this room and date to preload overrides
+      // 2. Fetch existing history for this room and date to preload ESP32-saved statuses
       const attRes = await api.get(`/attendance/${selectedLab.room_id}?date=${overrideDate}`);
       const existMap = {};
       attRes.data.forEach(a => existMap[a.student_id] = a.status);
 
-      const merged = initialSt.map(s => ({
-        ...s,
-        status: existMap[s.student_id] || 'present'
-      }));
+      // Students scanned by ESP32 get their saved status; unscanned students default to 'absent'
+      const merged = stRes.data
+        .map(s => ({
+          student_id: s.student_id,
+          name: s.name,
+          roll_number: s.roll_number,
+          // If ESP32 has a record → use it; otherwise → absent by default
+          status: existMap[s.student_id] || 'absent',
+          scannedByEsp32: !!existMap[s.student_id]
+        }))
+        // Sort ascending by roll number (numeric)
+        .sort((a, b) => Number(a.roll_number) - Number(b.roll_number));
 
       setStudents(merged);
       setStep(3);
