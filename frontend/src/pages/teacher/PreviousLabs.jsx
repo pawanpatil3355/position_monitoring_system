@@ -146,7 +146,7 @@ export default function PreviousLabs() {
                     <th>Student Name</th>
                     <th>Status</th>
                     <th>Timestamps</th>
-                    <th>Duration metrics</th>
+                    <th>Disconnects</th>
                     <th>Origin</th>
                   </tr>
                 </thead>
@@ -164,9 +164,8 @@ export default function PreviousLabs() {
                         In: {st.manually_marked ? 'N/A (Override)' : formatDT(st.entry_time)} <br/>
                         Out: {st.manually_marked ? 'N/A' : (formatDT(st.exit_time) !== '—' ? formatDT(st.exit_time) : (st.status === 'present' ? 'Lab Closed' : '—'))}
                       </td>
-                      <td style={{ fontSize: '0.85rem' }}>
-                        <span style={{ color: '#065f46', fontWeight: '600' }}>{st.duration_minutes}m Present</span> <br/>
-                        <span style={{ color: '#991b1b', opacity: 0.8 }}>{st.absent_duration_minutes}m Absent</span>
+                      <td style={{ fontSize: '0.85rem', color: st.disconnect_count > 3 ? '#991b1b' : 'inherit', fontWeight: st.disconnect_count ? '600' : 'normal' }}>
+                        {st.disconnect_count || 0}
                       </td>
                       <td>
                          {st.manually_marked ? (

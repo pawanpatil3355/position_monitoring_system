@@ -113,17 +113,17 @@ router.post('/rooms/:room_id/students', auth(['admin']), async (req, res) => {
 // POST /api/attendance/mark — manually mark attendance limits (admin only)
 router.post('/attendance/mark', auth(['admin']), async (req, res) => {
   try {
-    const { room_id, records, date, start_time, end_time } = req.body; 
-    
-    // Parse target date (defaults to today if not provided)
-    const targetDate = date ? new Date(date) : new Date();
-    targetDate.setHours(0, 0, 0, 0);
+    const { room_id, records, date, start_time, end_time } = req.body;
 
-    const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const targetDateStr = date || new Date().toISOString().split('T')[0];
+    const tD = new Date(targetDateStr);
+    const targetDate = new Date(`${tD.getUTCFullYear()}-${String(tD.getUTCMonth() + 1).padStart(2, '0')}-${String(tD.getUTCDate()).padStart(2, '0')}T00:00:00.000Z`);
+
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
     const dayName = dayNames[targetDate.getDay()];
     // Find schedule for this room & day (if not historical, it might be inactive, but UI guarantees validity)
     const schedule = await Schedule.findOne({ room_id, day: dayName });
-    
+
     const subject = schedule ? schedule.subject : 'Manual Override Lab';
     const teacher_id = schedule ? schedule.teacher_id : '';
     const teacherEntity = await Teacher.findById(req.user.id);
@@ -142,17 +142,17 @@ router.post('/attendance/mark', auth(['admin']), async (req, res) => {
       cEnd = new Date(targetDate);
       const [eh, em] = end_time.split(':').map(Number);
       cEnd.setHours(eh, em, 0, 0);
-      
+
       totalClassMins = Math.round((cEnd - cStart) / 60000);
     }
 
     const bulkOps = records.map(r => {
       let duration = 0;
       let absent_duration = totalClassMins;
-      
+
       // If manually marked present or late, they receive full lab duration credit
       if (r.status === 'present' || r.status === 'late') {
-        duration = totalClassMins; 
+        duration = totalClassMins;
         absent_duration = 0;
       }
 
@@ -192,22 +192,22 @@ router.get('/attendance/history', auth(['admin']), async (req, res) => {
 
     // 1. Get Teacher's assigned schedule
     const schedules = await Schedule.find({ teacher_id: teacherEntity.teacher_id });
-    
+
     const roomIds = [...new Set(schedules.map(s => s.room_id))];
     const records = await Attendance.find({ room_id: { $in: roomIds } });
 
     const groups = {};
-    const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
     records.forEach(r => {
-      if(!r.date) return;
+      if (!r.date) return;
       const rDate = new Date(r.date);
       const year = rDate.getFullYear();
       const month = String(rDate.getMonth() + 1).padStart(2, '0');
       const day = String(rDate.getDate()).padStart(2, '0');
       const dateStr = `${year}-${month}-${day}`;
       const dayName = dayNames[rDate.getDay()];
-      
+
       // Validate this block belongs strictly to the active schedule and Subject
       const matchedSchedule = schedules.find(s => s.room_id === r.room_id && s.day === dayName && s.subject === r.subject);
       if (!matchedSchedule) return;
@@ -215,37 +215,34 @@ router.get('/attendance/history', auth(['admin']), async (req, res) => {
       const key = `${dateStr}_${r.room_id}_${r.subject}`;
       if (!groups[key]) {
         groups[key] = {
-           id: key,
-           date: dateStr,
-           room_id: r.room_id,
-           subject: matchedSchedule.subject,
-           start_time: matchedSchedule.start_time,
-           end_time: matchedSchedule.end_time,
-           total_students: 0,
-           present_count: 0
+          id: key,
+          date: dateStr,
+          room_id: r.room_id,
+          subject: matchedSchedule.subject,
+          start_time: matchedSchedule.start_time,
+          end_time: matchedSchedule.end_time,
+          total_students: 0,
+          present_count: 0,
+          _studentsSeen: new Set(),
+          _presentSeen: new Set()
         };
       }
-      
-      let currentStatus = r.status;
-      if (!r.manually_marked) {
-         let totalMins = 120;
-         if (r.class_start_time && r.class_end_time) {
-           totalMins = (new Date(r.class_end_time) - new Date(r.class_start_time)) / 60000;
-         }
-         if (totalMins <= 0) totalMins = 120;
-         const d = r.duration_minutes || 0;
-         if (d >= 0.9 * totalMins) currentStatus = 'present';
-         else if (d > 0) currentStatus = 'late';
-         else currentStatus = 'absent';
-      }
 
-      groups[key].total_students++;
+      let currentStatus = r.status;
+
+      groups[key]._studentsSeen.add(r.student_id);
+      groups[key].total_students = groups[key]._studentsSeen.size;
+
       if (currentStatus === 'present' || currentStatus === 'late') {
-         groups[key].present_count++;
+        groups[key]._presentSeen.add(r.student_id);
       }
+      groups[key].present_count = groups[key]._presentSeen.size;
     });
 
-    const historyList = Object.values(groups).sort((a, b) => new Date(b.date) - new Date(a.date));
+    const historyList = Object.values(groups).map(g => {
+      const { _studentsSeen, _presentSeen, ...cleanGroup } = g;
+      return cleanGroup;
+    }).sort((a, b) => new Date(b.date) - new Date(a.date));
     res.json(historyList);
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -258,66 +255,96 @@ router.get('/attendance/:room_id', auth(['admin']), async (req, res) => {
     const { date, subject } = req.query;
     const query = { room_id: req.params.room_id };
     if (subject) query.subject = subject;
+    // Helper for strict IST dates
+    const getISTDate = (isoOrTimeStr, isTime = false) => {
+      if (isTime) {
+        let [sh, sm] = isoOrTimeStr.split(':').map(Number);
+        const now = new Date();
+        const istTimeMs = now.getTime() + (5.5 * 3600000);
+        const istDate = new Date(istTimeMs);
+        const year = istDate.getUTCFullYear();
+        const month = String(istDate.getUTCMonth() + 1).padStart(2, '0');
+        const dt = String(istDate.getUTCDate()).padStart(2, '0');
+        let utcMins = (sh * 60 + sm) - (5.5 * 60);
+        if (utcMins < 0) utcMins += 24 * 60;
+        const h = String(Math.floor(utcMins / 60)).padStart(2, '0');
+        const m = String(utcMins % 60).padStart(2, '0');
+        return new Date(`${year}-${month}-${dt}T${h}:${m}:00.000Z`);
+      } else {
+        const dObj = new Date(isoOrTimeStr);
+        const year = dObj.getUTCFullYear();
+        const month = String(dObj.getUTCMonth() + 1).padStart(2, '0');
+        const dt = String(dObj.getUTCDate()).padStart(2, '0');
+        return new Date(`${year}-${month}-${dt}T00:00:00.000Z`);
+      }
+    };
+
     let d, d2;
     if (date) {
-      d = new Date(date);
-      d.setHours(0, 0, 0, 0);
-      d2 = new Date(d); d2.setDate(d2.getDate() + 1);
+      d = getISTDate(date, false);
+      d2 = new Date(d); d2.setUTCDate(d2.getUTCDate() + 1);
       query.date = { $gte: d, $lt: d2 };
     }
 
     // --- AUTO SPILL-OVER LOGIC ---
     if (subject && date) {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      if (d && d.getTime() === today.getTime()) {
-         const activeStudents = await Student.find({ current_room: req.params.room_id });
-         if (activeStudents.length > 0) {
-            const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-            const dayName = dayNames[today.getDay()];
-            const schedule = await Schedule.findOne({ room_id: req.params.room_id, subject, day: dayName });
-            if (schedule) {
-               const [sh, sm] = schedule.start_time.split(':').map(Number);
-               const classStart = new Date(today); classStart.setHours(sh, sm, 0, 0);
-               const [eh, em] = schedule.end_time.split(':').map(Number);
-               const classEnd = new Date(today); classEnd.setHours(eh, em, 0, 0);
-               const now = new Date();
+      const now = new Date();
+      const istTimeMs = now.getTime() + (5.5 * 3600000);
+      const istDate = new Date(istTimeMs);
 
-               const currentMins = now.getHours() * 60 + now.getMinutes();
-               const startMins = sh * 60 + sm;
-               const endMins = eh * 60 + em;
-               
-               // Only mirror presence if the Subject is actively operating natively today
-               if (currentMins >= startMins - 15 && currentMins <= endMins + 15) {
-                   for (let st of activeStudents) {
-                      let att = await Attendance.findOne({ student_id: st.student_id, room_id: req.params.room_id, date: today, subject });
-                      if (!att) {
-                         const diffMins = (now - classStart) / 60000;
-                         const status = diffMins > 10 ? 'late' : 'present';
-                         att = new Attendance({
-                            student_id: st.student_id,
-                            room_id: req.params.room_id,
-                            subject: subject,
-                            teacher_id: schedule.teacher_id,
-                            date: today,
-                            entry_time: now,
-                            last_session_start: now,
-                            status: status,
-                            class_start_time: classStart,
-                            class_end_time: classEnd,
-                            duration_minutes: 0,
-                            absent_duration_minutes: 120,
-                            disconnect_count: 0
-                         });
-                         await att.save();
-                      } else if (!att.last_session_start && !att.manually_marked) {
-                         att.last_session_start = now;
-                         await att.save();
-                      }
-                   }
-               }
+      const year = istDate.getUTCFullYear();
+      const month = String(istDate.getUTCMonth() + 1).padStart(2, '0');
+      const dt = String(istDate.getUTCDate()).padStart(2, '0');
+      const today = new Date(`${year}-${month}-${dt}T00:00:00.000Z`);
+
+      if (d && d.getTime() === today.getTime()) {
+        const activeStudents = await Student.find({ current_room: req.params.room_id });
+        if (activeStudents.length > 0) {
+          const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+          const dayName = dayNames[istDate.getUTCDay()];
+          const schedule = await Schedule.findOne({ room_id: req.params.room_id, subject, day: dayName });
+          if (schedule) {
+            const classStart = getISTDate(schedule.start_time, true);
+            const classEnd = getISTDate(schedule.end_time, true);
+
+            const currentMins = istDate.getUTCHours() * 60 + istDate.getUTCMinutes();
+            const [sh, sm] = schedule.start_time.split(':').map(Number);
+            const [eh, em] = schedule.end_time.split(':').map(Number);
+            const startMins = sh * 60 + sm;
+            const endMins = eh * 60 + em;
+
+            if (currentMins >= startMins && currentMins <= endMins + 15) {
+              for (let st of activeStudents) {
+                let att = await Attendance.findOne({ student_id: st.student_id, room_id: req.params.room_id, date: today, subject });
+                if (!att) {
+                  const classDurationMins = (classEnd - classStart) / 60000;
+                  const gracePeriodMins = classDurationMins * (1 / 12); // exactly 8.33%
+
+                  const diffMins = (now - classStart) / 60000;
+                  const status = diffMins > gracePeriodMins ? 'late' : 'present';
+                  att = new Attendance({
+                    student_id: st.student_id,
+                    room_id: req.params.room_id,
+                    subject: subject,
+                    teacher_id: schedule.teacher_id,
+                    date: today,
+                    entry_time: now,
+                    last_session_start: now,
+                    status: status,
+                    class_start_time: classStart,
+                    class_end_time: classEnd,
+                    duration_minutes: 0,
+                    absent_duration_minutes: 120,
+                    disconnect_count: 0
+                  });
+                  await att.save();
+                } else if (!att.last_session_start && !att.manually_marked) {
+                  await Attendance.updateOne({ _id: att._id }, { $set: { last_session_start: now } });
+                }
+              }
             }
-         }
+          }
+        }
       }
     }
     // ----------------------------
@@ -332,44 +359,9 @@ router.get('/attendance/:room_id', auth(['admin']), async (req, res) => {
 
     const enriched = records.map(r => {
       let rObj = r.toObject();
-      let liveDuration = rObj.duration_minutes || 0;
-      
-      if (rObj.last_session_start && !rObj.manually_marked) {
-         const now = new Date();
-         const classStartTime = rObj.class_start_time ? new Date(rObj.class_start_time) : new Date(0);
-         const classEndTime = rObj.class_end_time ? new Date(rObj.class_end_time) : now;
-         
-         const effectiveExitTime = now > classEndTime ? classEndTime : now;
-         const effectiveStartTime = new Date(rObj.last_session_start) < classStartTime ? classStartTime : new Date(rObj.last_session_start);
-         
-         if (effectiveStartTime < effectiveExitTime) {
-           liveDuration += (effectiveExitTime - effectiveStartTime) / 60000;
-         }
-      }
-      
-      let liveAbsent = rObj.absent_duration_minutes !== undefined ? rObj.absent_duration_minutes : 120;
-      if (rObj.class_start_time && rObj.class_end_time) {
-         const totalClassMins = (new Date(rObj.class_end_time) - new Date(rObj.class_start_time)) / 60000;
-         liveAbsent = Math.max(0, totalClassMins - liveDuration);
-      }
-
-      let currentStatus = rObj.status;
-      if (!rObj.manually_marked) {
-         let totalMins = 120;
-         if (rObj.class_start_time && rObj.class_end_time) {
-            totalMins = Math.round((new Date(rObj.class_end_time) - new Date(rObj.class_start_time)) / 60000);
-         }
-         if (totalMins <= 0) totalMins = 120;
-         if (liveDuration >= 0.9 * totalMins) currentStatus = 'present';
-         else if (liveDuration > 0) currentStatus = 'late';
-         else currentStatus = 'absent';
-      }
 
       return {
         ...rObj,
-        status: currentStatus,
-        duration_minutes: Math.round(liveDuration),
-        absent_duration_minutes: Math.round(liveAbsent),
         student_name: studentMap[r.student_id]?.name || r.student_id,
         roll_number: studentMap[r.student_id]?.roll_number || '',
         class: studentMap[r.student_id]?.class || '',

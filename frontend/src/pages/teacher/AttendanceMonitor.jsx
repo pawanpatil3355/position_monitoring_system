@@ -10,6 +10,14 @@ function formatDT(dt) {
   return new Date(dt).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+function displayExitTime(r) {
+  if (r.exit_time) return formatDT(r.exit_time);
+  if (r.class_end_time && Date.now() > new Date(r.class_end_time).getTime()) {
+    return formatDT(r.class_end_time);
+  }
+  return '—';
+}
+
 export default function AttendanceMonitor() {
   const [rooms, setRooms] = useState([]);
   const [records, setRecords] = useState([]);
@@ -30,36 +38,37 @@ export default function AttendanceMonitor() {
         const myRooms = rRes.data.filter(r => myRoomIds.includes(r.room_id));
         setRooms(myRooms);
       })
-      .catch(() => {});
+      .catch(() => { });
   }, []);
 
   const getActiveSchedule = () => {
     if (!selectedRoom) return null;
     const today = new Date();
-    
+
     const selD = new Date(selectedDate);
     if (selD.toDateString() !== today.toDateString()) return null;
 
-    const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
     const todayName = dayNames[today.getDay()];
-    
+
     const activeForRoom = schedules.filter(s => s.room_id === selectedRoom && s.day === todayName);
     const currentMins = today.getHours() * 60 + today.getMinutes();
-    
+
     let matched = null;
     for (let s of activeForRoom) {
-        const [sh, sm] = s.start_time.split(':').map(Number);
-        const [eh, em] = s.end_time.split(':').map(Number);
-        // Allows 30m early viewing up til exactly math end time
-        if (currentMins >= (sh * 60 + sm) - 30 && currentMins <= (eh * 60 + em)) {
-             matched = s;
-             break;
-        }
+      const [sh, sm] = s.start_time.split(':').map(Number);
+      const [eh, em] = s.end_time.split(':').map(Number);
+      if (currentMins >= (sh * 60 + sm) - 1 && currentMins <= (eh * 60 + em)) {
+        matched = s;
+        break;
+      }
     }
     return matched;
   };
 
   const isLabActive = () => !!getActiveSchedule();
+
+
 
   const loadData = async (showLoading = true) => {
     if (!selectedRoom) return;
@@ -68,7 +77,7 @@ export default function AttendanceMonitor() {
       const activeSched = getActiveSchedule();
       const params = { date: selectedDate };
       if (activeSched) params.subject = activeSched.subject;
-      
+
       const r = await api.get(`/attendance/${selectedRoom}`, { params });
       setRecords(r.data);
     } catch {
@@ -83,7 +92,8 @@ export default function AttendanceMonitor() {
   }, [selectedRoom, selectedDate]);
 
 
-  // Silent background polling every 2 seconds
+  // Silent background polling every 2 seconds to fetch DB truth
+  // and trigger react re-render for live timer updates
   usePolling(() => {
     if (isLabActive()) {
       loadData(false);
@@ -148,10 +158,10 @@ export default function AttendanceMonitor() {
           </div>
         ) : !isLabActive() ? (
           <div className="card" style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>
-             <Filter size={40} style={{ marginBottom: '1rem', opacity: 0.5, color: '#ef4444' }} />
-             <p style={{ fontWeight: '500', fontSize: '1.1rem', color: '#ef4444' }}>Live monitoring disabled.</p>
-             <p style={{ marginTop: '6px' }}>This class session is currently inactive or has already concluded.</p>
-             <p style={{ marginTop: '2px', fontSize: '0.85rem' }}>Please open the <b>Previous Labs (History)</b> tab to review finalized attendance.</p>
+            <Filter size={40} style={{ marginBottom: '1rem', opacity: 0.5, color: '#ef4444' }} />
+            <p style={{ fontWeight: '500', fontSize: '1.1rem', color: '#ef4444' }}>Live monitoring disabled.</p>
+            <p style={{ marginTop: '6px' }}>This class session is currently inactive or has already concluded.</p>
+            <p style={{ marginTop: '2px', fontSize: '0.85rem' }}>Please open the <b>Previous Labs (History)</b> tab to review finalized attendance.</p>
           </div>
         ) : (
           <div className="table-container">
@@ -162,8 +172,7 @@ export default function AttendanceMonitor() {
                   <th>Roll No.</th>
                   <th>Entry Time</th>
                   <th>Exit Time</th>
-                  <th>Present (m)</th>
-                  <th>Absent (m)</th>
+                  <th>Disconnects</th>
                   <th>Status</th>
                   <th>Marked By</th>
                 </tr>
@@ -177,11 +186,12 @@ export default function AttendanceMonitor() {
                       <td style={{ fontWeight: '600' }}>{r.student_name}</td>
                       <td style={{ color: 'var(--text-muted)' }}>{r.roll_number}</td>
                       <td>{r.entry_time ? formatDT(r.entry_time) : '—'}</td>
-                      <td>{r.exit_time ? formatDT(r.exit_time) : '—'}</td>
-                      <td>{r.duration_minutes || 0} min</td>
-                      <td style={{ color: r.absent_duration_minutes > 0 ? 'var(--danger)' : 'inherit' }}>
-                        {r.absent_duration_minutes !== undefined ? r.absent_duration_minutes : 120} min
+                      <td>{displayExitTime(r)}</td>
+
+                      <td style={{ color: r.disconnect_count > 3 ? 'var(--danger)' : 'inherit', fontWeight: r.disconnect_count ? '600' : 'normal' }}>
+                        {r.disconnect_count || 0}
                       </td>
+
                       <td><span className={`badge badge-${r.status}`}>{r.status}</span></td>
                       <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                         {r.manually_marked ? (r.marked_by || 'Teacher') : 'Auto (ESP32)'}

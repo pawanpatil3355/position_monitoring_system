@@ -59,27 +59,43 @@ router.post('/student-detected', esp32Auth, async (req, res) => {
     );
     if (!student) return res.status(404).json({ message: 'Student not found' });
 
-    // Get today's date (normalized to midnight)
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // Helpers for strict IST handling on any server OS
+    const now = new Date();
+    const istMs = now.getTime() + (5.5 * 3600000);
+    const istNow = new Date(istMs);
+    const year = istNow.getUTCFullYear();
+    const month = String(istNow.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(istNow.getUTCDate()).padStart(2, '0');
+    const today = new Date(`${year}-${month}-${d}T00:00:00.000Z`);
+
+    const getISTDate = (timeStr) => {
+      let [sh, sm] = timeStr.split(':').map(Number);
+      let utcMins = (sh * 60 + sm) - (5.5 * 60);
+      if (utcMins < 0) utcMins += 24 * 60;
+      const h = String(Math.floor(utcMins / 60)).padStart(2, '0');
+      const m = String(utcMins % 60).padStart(2, '0');
+      return new Date(`${year}-${month}-${d}T${h}:${m}:00.000Z`);
+    };
 
     // Get schedule for this room today
-    const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-    const dayName = dayNames[new Date().getDay()];
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const dayName = dayNames[istNow.getUTCDay()];
     const schedules = await Schedule.find({ room_id, day: dayName, is_active: true });
-    
+
     let schedule = null;
-    const nowLocal = new Date();
-    const currentMins = nowLocal.getHours() * 60 + nowLocal.getMinutes();
+    const currentMins = istNow.getUTCHours() * 60 + istNow.getUTCMinutes();
     for (let s of schedules) {
-        const [sh, sm] = s.start_time.split(':').map(Number);
-        const [eh, em] = s.end_time.split(':').map(Number);
-        if (currentMins >= (sh * 60 + sm) - 15 && currentMins <= (eh * 60 + em) + 15) {
-             schedule = s;
-             break;
-        }
+      const [sh, sm] = s.start_time.split(':').map(Number);
+      const [eh, em] = s.end_time.split(':').map(Number);
+      if (currentMins >= (sh * 60 + sm) && currentMins <= (eh * 60 + em) + 15) {
+        schedule = s;
+        break;
+      }
     }
-    if (!schedule && schedules.length > 0) schedule = schedules[0];
+
+    if (!schedule) {
+      return res.json({ message: 'No active lab schedule at this time. Location updated.' });
+    }
 
     let classStart = null, classEnd = null, status = 'present';
     let subjectName = null, subjectTeacher = null;
@@ -87,21 +103,20 @@ router.post('/student-detected', esp32Auth, async (req, res) => {
     if (schedule) {
       subjectName = schedule.subject;
       subjectTeacher = schedule.teacher_id;
-      
-      const [sh, sm] = schedule.start_time.split(':').map(Number);
-      classStart = new Date(today); classStart.setHours(sh, sm, 0, 0);
-      
-      const [eh, em] = schedule.end_time.split(':').map(Number);
-      classEnd = new Date(today); classEnd.setHours(eh, em, 0, 0);
 
-      const now = new Date();
+      classStart = getISTDate(schedule.start_time);
+      classEnd = getISTDate(schedule.end_time);
+
+      const classDurationMins = (classEnd - classStart) / 60000;
+      const gracePeriodMins = classDurationMins * (1 / 12); // exactly 8.33%
+
       const diffMins = (now - classStart) / 60000;
-      status = diffMins > 10 ? 'late' : 'present';
+      status = diffMins > gracePeriodMins ? 'late' : 'present';
     }
 
     // Check if record exists for this specific Subject block
     let attendance = await Attendance.findOne({ student_id, room_id, date: today, subject: subjectName });
-    
+
     // Do not override if teacher manually marked it
     if (attendance && attendance.manually_marked) {
       return res.json({ message: 'Student detected, skipped because manually marked by teacher.', attendance });
@@ -126,14 +141,34 @@ router.post('/student-detected', esp32Auth, async (req, res) => {
       });
       await attendance.save();
     } else {
+      let updateFields = {};
       if (!attendance.last_session_start) {
         // Recovering from a disconnect
-        attendance.last_session_start = new Date();
+        updateFields.last_session_start = new Date();
       }
-      if (attendance.status === 'absent') {
-        attendance.status = status;
+      let newStatus = 'present';
+      if (classStart && classEnd) {
+        const classDurationMins = (classEnd.getTime() - classStart.getTime()) / 60000;
+        const gracePeriodMins = classDurationMins * (1 / 12);
+        const initialDiffMins = (attendance.entry_time.getTime() - classStart.getTime()) / 60000;
+        if (initialDiffMins > gracePeriodMins) newStatus = 'late';
       }
-      await attendance.save();
+      
+      if (attendance.disconnect_count > 3) {
+        newStatus = 'late';
+      }
+
+      if (attendance.status === 'absent' || (attendance.status === 'present' && newStatus === 'late')) {
+        updateFields.status = newStatus;
+      }
+
+      if (Object.keys(updateFields).length > 0) {
+        attendance = await Attendance.findOneAndUpdate(
+          { _id: attendance._id },
+          { $set: updateFields },
+          { new: true }
+        );
+      }
     }
 
     res.json({ message: 'Student detected, attendance recorded', attendance });
@@ -151,50 +186,64 @@ router.post('/student-left', esp32Auth, async (req, res) => {
     // Update student
     await Student.findOneAndUpdate({ student_id }, { current_room: null, is_present: false });
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // Helper for strict IST handling
+    const now = new Date();
+    const istMs = now.getTime() + (5.5 * 3600000);
+    const istNow = new Date(istMs);
+    const year = istNow.getUTCFullYear();
+    const month = String(istNow.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(istNow.getUTCDate()).padStart(2, '0');
+    const today = new Date(`${year}-${month}-${d}T00:00:00.000Z`);
 
     // Resolve the active tracking record for the most recent Subject block
     const attendance = await Attendance.findOne({ student_id, room_id, date: today }).sort({ class_start_time: -1 });
-    
+
     // Do not override if teacher manually marked it
     if (attendance && attendance.manually_marked) {
       return res.json({ message: 'Student left, skipped attendance calc because manually marked.' });
     }
 
     if (attendance) {
-      // Increment the dropped connection count
-      attendance.disconnect_count = (attendance.disconnect_count || 0) + 1;
+      let updateFields = { status: 'absent' };
+      let incFields = {};
 
       if (attendance.last_session_start) {
         const exitTime = new Date();
         const classStartTime = attendance.class_start_time || new Date(0);
         const classEndTime = attendance.class_end_time || exitTime;
-        
+
         // Cap the measurable exit and start times to the precise lab boundaries
         const effectiveExitTime = exitTime > classEndTime ? classEndTime : exitTime;
         const effectiveStartTime = attendance.last_session_start < classStartTime ? classStartTime : attendance.last_session_start;
-        
+
+        if (exitTime.getTime() >= classStartTime.getTime() && exitTime.getTime() <= classEndTime.getTime()) {
+          incFields.disconnect_count = 1;
+        }
+
+        let sessionMinutes = 0;
         // Only accrue duration if there is valid intersection with the class
         if (effectiveStartTime < effectiveExitTime) {
           const durationMs = effectiveExitTime - effectiveStartTime;
-          const sessionMinutes = durationMs / 60000;
-          attendance.duration_minutes = (attendance.duration_minutes || 0) + sessionMinutes;
+          sessionMinutes = durationMs / 60000;
+          incFields.duration_minutes = sessionMinutes;
         }
-        
-        attendance.exit_time = exitTime; 
-        attendance.last_session_start = null; // Close the continuous tracking session
 
-        const totalClassMins = attendance.class_start_time && attendance.class_end_time 
-          ? (attendance.class_end_time - attendance.class_start_time) / 60000 
+        updateFields.exit_time = effectiveExitTime;
+        updateFields.last_session_start = null; // Close the continuous tracking session
+
+        const totalClassMins = attendance.class_start_time && attendance.class_end_time
+          ? (attendance.class_end_time - attendance.class_start_time) / 60000
           : 120;
-          
-        attendance.absent_duration_minutes = Math.max(0, totalClassMins - attendance.duration_minutes);
+
+        const updatedDuration = (attendance.duration_minutes || 0) + sessionMinutes;
+        updateFields.absent_duration_minutes = Math.max(0, totalClassMins - updatedDuration);
       }
-      
-      attendance.status = 'absent'; // Force status to absent so Dashboard only shows currently active students
-      
-      await attendance.save();
+
+      let updateParams = { $set: updateFields };
+      if (Object.keys(incFields).length > 0) {
+        updateParams.$inc = incFields;
+      }
+      await Attendance.updateOne({ _id: attendance._id }, updateParams);
     }
 
     res.json({ message: 'Student left, attendance updated' });

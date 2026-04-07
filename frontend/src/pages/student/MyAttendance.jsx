@@ -9,6 +9,14 @@ function formatDT(dt) {
   return new Date(dt).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
+function displayExitTime(r) {
+  if (r.exit_time) return formatDT(r.exit_time);
+  if (r.class_end_time && Date.now() > new Date(r.class_end_time).getTime()) {
+    return formatDT(r.class_end_time);
+  }
+  return '—';
+}
+
 function formatDate(dt) {
   if (!dt) return '—';
   return new Date(dt).toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' });
@@ -97,8 +105,7 @@ export default function MyAttendance() {
               <th>Room</th>
               <th>Entry Time</th>
               <th>Exit Time</th>
-              <th>Present (m)</th>
-              <th>Absent (m)</th>
+              <th>Disconnects</th>
               <th>Status</th>
               <th>Marked By</th>
             </tr>
@@ -114,10 +121,9 @@ export default function MyAttendance() {
                   <td style={{ color: 'var(--text-muted)' }}>{r.teacher_id || '—'}</td>
                   <td style={{ color: 'var(--text-muted)', fontFamily: 'monospace', fontSize: '0.8rem' }}>{r.room_id}</td>
                   <td>{r.entry_time ? formatDT(r.entry_time) : '—'}</td>
-                  <td>{r.exit_time ? formatDT(r.exit_time) : '—'}</td>
-                  <td>{r.duration_minutes || 0} min</td>
-                  <td style={{ color: r.absent_duration_minutes > 0 ? 'var(--danger)' : 'inherit' }}>
-                    {r.absent_duration_minutes !== undefined ? r.absent_duration_minutes : 120} min
+                  <td>{displayExitTime(r)}</td>
+                  <td style={{ color: r.disconnect_count > 3 ? 'var(--danger)' : 'inherit', fontWeight: r.disconnect_count ? '600' : 'normal' }}>
+                    {r.disconnect_count || 0}
                   </td>
                   <td><span className={`badge badge-${r.status}`}>{r.status}</span></td>
                   <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
